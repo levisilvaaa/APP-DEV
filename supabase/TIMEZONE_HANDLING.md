@@ -1,0 +1,185 @@
+# Timezone Handling Documentation
+
+## Overview
+
+This application uses a **client-side timezone approach** where all date calculations are performed in the user's local timezone. This ensures that users around the world have a consistent experience with daily check-ins and progress tracking based on their local time.
+
+## Core Principles
+
+### 1. Client-Side Timezone Detection
+- The application automatically detects the user's timezone using `Intl.DateTimeFormat().resolvedOptions().timeZone`
+- No timezone information is stored in the database or user preferences
+- All date/time calculations are performed on the client using timezone utility functions
+
+### 2. Date Storage Format
+- Check-in dates are stored as **DATE type** (YYYY-MM-DD) in the `daily_checkins` table
+- This format is timezone-agnostic and represents a calendar date without time information
+- The date represents the **user's local date** at the time of check-in
+
+### 3. Timezone Utility Functions
+
+All timezone-related operations are handled by utility functions in `/utils/timezone.ts`:
+
+- `getUserTimezone()` - Returns the user's timezone identifier
+- `getLocalDateString()` - Returns today's date in YYYY-MM-DD format (user's local time)
+- `getStartOfDay()` - Returns start of day (00:00:00) in user's timezone
+- `getStartOfMonth()` - Returns first day of current month in user's timezone
+- `getEndOfMonth()` - Returns last day of current month in user's timezone
+- `getTimeUntilMidnight()` - Calculates milliseconds until next midnight in user's timezone
+- `isSameDay()` - Compares if two dates are the same day in user's timezone
+- `getDateDaysAgo()` - Returns a date N days ago from today
+
+## Database Schema
+
+### daily_checkins Table
+
+```sql
+CREATE TABLE daily_checkins (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  checkin_date date NOT NULL DEFAULT CURRENT_DATE,
+  created_at timestamptz DEFAULT now(),
+  updated_at timestamptz DEFAULT now(),
+  CONSTRAINT unique_user_date_checkin UNIQUE(user_id, checkin_date)
+);
+```
+
+**Important Notes:**
+- `checkin_date` is stored as DATE (not TIMESTAMP) to avoid timezone complications
+- The UNIQUE constraint on (user_id, checkin_date) prevents duplicate check-ins per day
+- `created_at` uses timestamptz for audit purposes but is not used for check-in logic
+
+### Indexes
+
+The following indexes optimize timezone-based queries:
+
+```sql
+-- Optimizes user-specific queries
+CREATE INDEX idx_daily_checkins_user_id ON daily_checkins(user_id);
+
+-- Optimizes date-based sorting and filtering
+CREATE INDEX idx_daily_checkins_date ON daily_checkins(checkin_date DESC);
+
+-- Optimizes the most common query pattern (user + date)
+CREATE INDEX idx_daily_checkins_user_date ON daily_checkins(user_id, checkin_date DESC);
+```
+
+## How It Works
+
+### Daily Check-In Flow
+
+1. **User clicks "Mark as Complete"**
+   - App calls `getLocalDateString()` to get current date in user's timezone
+   - Date format: "YYYY-MM-DD" (e.g., "2025-10-24")
+
+2. **Database Insert**
+   ```typescript
+   const today = getLocalDateString();
+   await supabase.from('daily_checkins').insert({
+     user_id: user.id,
+     checkin_date: today,
+   });
+   ```
+
+3. **Duplicate Prevention**
+   - The UNIQUE constraint ensures only one check-in per user per date
+   - If user tries to check-in twice, database returns error code '23505'
+
+### Midnight Reset
+
+The app automatically resets check-in status at midnight using:
+
+```typescript
+const timeUntilMidnight = getTimeUntilMidnight();
+setTimeout(() => {
+  setCheckedToday(false);
+  loadData();
+}, timeUntilMidnight);
+```
+
+This ensures the UI updates immediately when a new day begins in the user's timezone.
+
+### Monthly Statistics
+
+Monthly stats are calculated using timezone-aware functions:
+
+```typescript
+const startOfMonth = getStartOfMonth();
+const endOfMonth = getEndOfMonth();
+const currentDay = getCurrentDayOfMonth();
+
+// Query check-ins for current month
+const { data } = await supabase
+  .from('daily_checkins')
+  .select('*')
+  .eq('user_id', user.id)
+  .gte('checkin_date', startOfMonth.toISOString().split('T')[0])
+  .lte('checkin_date', endOfMonth.toISOString().split('T')[0]);
+```
+
+## Edge Cases Handled
+
+### 1. User Travels to Different Timezone
+- Check-ins continue to work normally in the new timezone
+- Historical check-ins remain valid and are not affected
+- The system uses the date in the user's **current** timezone
+
+### 2. Daylight Saving Time (DST)
+- `getTimeUntilMidnight()` automatically handles DST transitions
+- Uses native JavaScript Date API which accounts for DST changes
+
+### 3. International Date Line
+- Users crossing the International Date Line will see date changes immediately
+- Check-ins are always based on the device's current timezone setting
+
+### 4. Database vs Client Timezone Mismatch
+- Not an issue because we store dates (not timestamps)
+- Date comparisons are done on the client side
+- Database queries use date strings generated by client
+
+## Testing Recommendations
+
+To test timezone handling:
+
+1. **Change device timezone** and verify:
+   - Daily check-in works correctly
+   - Monthly stats reflect the new timezone
+   - Midnight reset occurs at local midnight
+
+2. **Simulate timezone travel**:
+   - Create check-ins in timezone A
+   - Change to timezone B
+   - Verify historical data remains intact
+   - Verify new check-in uses timezone B's date
+
+3. **Test DST transitions**:
+   - Set device to a timezone with DST
+   - Test check-in behavior around DST switch dates
+
+## Migration Notes
+
+This system **does not require a database migration** because:
+- The `daily_checkins` table already uses DATE type for `checkin_date`
+- Existing check-in records remain valid and compatible
+- The change is purely in how the client generates and interprets dates
+
+## Benefits of This Approach
+
+1. **Simplicity**: No timezone data stored or managed in database
+2. **Flexibility**: Supports users anywhere in the world automatically
+3. **Reliability**: Native timezone detection via JavaScript Intl API
+4. **Performance**: Client-side calculations reduce server load
+5. **Privacy**: User timezone is never transmitted or stored
+
+## Limitations
+
+- Requires JavaScript to be enabled (standard for React Native)
+- Relies on device having correct timezone settings
+- Historical data is interpreted in user's current timezone (by design)
+
+## Future Enhancements
+
+Potential improvements:
+- Add timezone display in Settings for transparency
+- Allow manual timezone override (optional)
+- Add timezone to user profile for analytics purposes
